@@ -100,6 +100,7 @@ agent-swarm delete TICKET-100
 | `agent-swarm project list` | List all projects |
 | `agent-swarm project ssh <NAME>` | SSH into project (auto-starts if stopped) |
 | `agent-swarm project stop <NAME>` | Stop and save as new ticket baseline |
+| `agent-swarm project run <NAME> <command...>` | Run a command in a project VM |
 | `agent-swarm project code <NAME> [path]` | Open VS Code remote into project VM |
 | `agent-swarm project delete <NAME>` | Delete project VM and disk |
 
@@ -110,10 +111,37 @@ agent-swarm delete TICKET-100
 | `agent-swarm create <PROJECT> <TICKET>` | Create ticket VM cloned from project |
 | `agent-swarm list` | List all ticket VMs |
 | `agent-swarm ssh <TICKET>` | SSH into ticket VM |
+| `agent-swarm run <TICKET> <command...>` | Run a command inside a ticket VM |
 | `agent-swarm code <TICKET> [path]` | Open VS Code remote into ticket VM |
 | `agent-swarm start <TICKET>` | Start a stopped ticket VM |
 | `agent-swarm stop <TICKET>` | Stop a ticket VM |
 | `agent-swarm delete <TICKET>` | Delete a ticket VM |
+
+### File transfer
+
+| Command | Description |
+|---------|-------------|
+| `agent-swarm cp ./file TICKET:/path` | Copy a file into a VM |
+| `agent-swarm cp TICKET:/path ./file` | Copy a file from a VM |
+
+### Bulk operations
+
+| Command | Description |
+|---------|-------------|
+| `agent-swarm bulk create <PROJECT> <T1> <T2> ...` | Create multiple tickets in parallel |
+| `agent-swarm bulk delete <T1> <T2> ...` | Delete multiple tickets in parallel |
+| `agent-swarm bulk delete --project <NAME>` | Delete all tickets for a project |
+
+### Environment variables
+
+| Command | Description |
+|---------|-------------|
+| `agent-swarm env set <KEY> <VALUE>` | Set a global env var (encrypted) |
+| `agent-swarm env set <KEY> <VALUE> --project <NAME>` | Set a per-project override |
+| `agent-swarm env list` | List global env var names |
+| `agent-swarm env list --project <NAME>` | List resolved env var names for project |
+| `agent-swarm env rm <KEY>` | Remove a global env var |
+| `agent-swarm env rm <KEY> --project <NAME>` | Remove a per-project override |
 
 ### Snapshots
 
@@ -141,6 +169,78 @@ cat ~/.agent-swarm/setup.sh
 
 Changes to `setup.sh` take effect on the next `agent-swarm project create`.
 
+## Git SSH access inside VMs
+
+Agent Swarm forwards your host's SSH agent into VMs so git push/pull over SSH works without copying keys. For this to work, your key must be loaded in the agent:
+
+```bash
+# Check if your key is loaded
+ssh-add -l
+
+# If empty, add your key
+ssh-add ~/.ssh/id_ed25519
+
+# On macOS, to persist across reboots, add to Keychain
+ssh-add --apple-use-keychain ~/.ssh/id_ed25519
+```
+
+Then connect (or reconnect) to the VM:
+
+```bash
+agent-swarm project ssh myapp
+
+# Inside the VM, git SSH operations use your host key
+git clone git@github.com:you/repo.git
+git push origin main
+```
+
+If you see `Permission denied (publickey)`, exit the VM and verify `ssh-add -l` shows your key on the host, then reconnect.
+
+## Running agents in parallel
+
+The `run` and `bulk` commands are designed for orchestrating multiple AI agents:
+
+```bash
+# Create 3 ticket VMs in parallel
+agent-swarm bulk create myapp TICKET-1 TICKET-2 TICKET-3
+
+# Run agents in each VM (from separate terminals or scripts)
+agent-swarm run TICKET-1 claude --print "fix the login bug"
+agent-swarm run TICKET-2 claude --print "add unit tests for auth"
+agent-swarm run TICKET-3 claude --print "update the API docs"
+
+# Copy results back
+agent-swarm cp TICKET-1:/home/worker/project/results.json ./results-1.json
+
+# Clean up all ticket VMs for the project
+agent-swarm bulk delete --project myapp
+```
+
+## Encrypted environment variables
+
+Env vars are stored encrypted (AES-256-GCM) in the local SQLite registry, with the encryption key stored in macOS Keychain. They're automatically injected into all `run`, `project run`, `ssh`, and `project ssh` sessions.
+
+```bash
+# Set a global env var (available in all projects)
+agent-swarm env set ANTHROPIC_API_KEY sk-ant-...
+agent-swarm env set GITHUB_TOKEN ghp_...
+
+# Set a per-project override
+agent-swarm env set ANTHROPIC_API_KEY sk-different --project myapp
+
+# List env var names (values are never shown)
+agent-swarm env list
+agent-swarm env list --project myapp
+
+# Remove an env var
+agent-swarm env rm GITHUB_TOKEN
+agent-swarm env rm ANTHROPIC_API_KEY --project myapp
+```
+
+Per-project vars override global vars. Values are encrypted at rest — `sqlite3 ~/.agent-swarm/registry.db "select * from env_var"` shows only encrypted ciphertext.
+
+The secret storage uses a pluggable backend interface (`SecretBackend`), making it possible to swap in Vault, 1Password, AWS Secrets Manager, or other providers in the future.
+
 ## Features
 
 - **Instant cloning**: APFS copy-on-write means ticket VMs are created in seconds and use minimal disk space
@@ -157,7 +257,8 @@ Changes to `setup.sh` take effect on the next `agent-swarm project create`.
 src/
   cli.ts                    # CLI entry point and command routing
   provider.ts               # Provider interface (VM abstraction)
-  registry.ts               # SQLite registry for projects and tickets
+  registry.ts               # SQLite registry for projects, tickets, and env vars
+  secrets.ts                # Encrypted env var storage (pluggable backend)
   ssh.ts                    # SSH sessions with agent forwarding and code forwarding
   exec.ts                   # Command execution utilities
   providers/

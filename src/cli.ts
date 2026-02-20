@@ -3,8 +3,9 @@
 import * as registry from './registry.ts'
 import { detectProvider, getProvider, listProviders } from './providers/detect.ts'
 import { projectDiskPath } from './providers/macos-native.ts'
-import { sshInteractive } from './ssh.ts'
+import { sshInteractive, sshRun, scpTo, scpFrom } from './ssh.ts'
 import type { Provider } from './provider.ts'
+import { getSecretBackend } from './secrets.ts'
 import { existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
@@ -22,6 +23,7 @@ Usage:
   agent-swarm project create <NAME>               Create a project VM from base image
   agent-swarm project list                         List all projects
   agent-swarm project ssh <NAME>                   SSH into a project VM (auto-starts)
+  agent-swarm project run <NAME> <command...>      Run a command in a project VM
   agent-swarm project stop <NAME>                  Stop and save project (new ticket baseline)
   agent-swarm project code <NAME> [path]           Open VS Code remote into project VM
   agent-swarm project delete <NAME>                Delete a project VM and its disk
@@ -29,10 +31,23 @@ Usage:
   agent-swarm create <PROJECT> <TICKET>            Create a ticket VM (cloned from project)
   agent-swarm list                                 List all ticket VMs
   agent-swarm ssh <TICKET>                         SSH into a ticket VM
+  agent-swarm run <TICKET> <command...>            Run a command inside a ticket VM
   agent-swarm stop <TICKET>                        Stop a ticket VM
   agent-swarm start <TICKET>                       Start a stopped ticket VM
   agent-swarm code <TICKET> [path]                  Open VS Code remote into ticket VM
   agent-swarm delete <TICKET>                      Delete a ticket VM
+
+  agent-swarm cp <src> <dest>                      Copy files in/out of a VM
+  agent-swarm bulk create <PROJECT> <T1> <T2> ...  Create multiple tickets in parallel
+  agent-swarm bulk delete <T1> <T2> ...            Delete multiple tickets in parallel
+  agent-swarm bulk delete --project <NAME>         Delete all tickets for a project
+
+  agent-swarm env set <KEY> <VALUE>                Set a global env var (encrypted)
+  agent-swarm env set <KEY> <VALUE> --project X    Set a per-project env var override
+  agent-swarm env list                             List global env var names
+  agent-swarm env list --project X                 List resolved env var names for project
+  agent-swarm env rm <KEY>                         Remove a global env var
+  agent-swarm env rm <KEY> --project X             Remove a per-project env var
 
   agent-swarm checkpoint <TICKET> [name]           Create a snapshot
   agent-swarm restore <TICKET> [name]              Restore a snapshot
@@ -158,9 +173,29 @@ async function cmdProjectSsh(name: string) {
   // Wait for SSH to become reachable
   let info = await provider.sshInfo(proj.vm_id)
   registry.updateProjectIp(name, info.host)
+  const env = await getSecretBackend().resolve(name)
   console.log(`Connecting to project ${name} (${info.user}@${info.host}:${info.port})...`)
-  const code = await sshInteractive(info)
+  const code = await sshInteractive(info, env)
   process.exit(code)
+}
+
+async function cmdProjectRun(name: string, command: string) {
+  const proj = registry.getProject(name)
+  if (!proj) die(`No project found: ${name}`)
+  const provider = await resolveProviderForProject(name)
+
+  const actualStatus = await provider.status(proj.vm_id)
+  if (actualStatus !== 'running') {
+    console.log(`Starting project ${name}...`)
+    await provider.startVm(proj.vm_id)
+    registry.updateProjectStatus(name, 'running')
+  }
+
+  const info = await provider.sshInfo(proj.vm_id)
+  registry.updateProjectIp(name, info.host)
+  const env = await getSecretBackend().resolve(name)
+  const code = await sshRun(info, command, env)
+  if (code !== 0) process.exit(code)
 }
 
 async function cmdProjectStop(name: string) {
@@ -285,8 +320,9 @@ async function cmdSsh(ticket: string) {
   if (!env) die(`No environment found for ticket ${ticket}`)
   const provider = await resolveProvider(ticket)
   const info = await provider.sshInfo(env.vm_id)
+  const envVars = await getSecretBackend().resolve(env.project || '')
   console.log(`Connecting to ${ticket} (${info.user}@${info.host}:${info.port})...`)
-  const code = await sshInteractive(info)
+  const code = await sshInteractive(info, envVars)
   process.exit(code)
 }
 
@@ -324,6 +360,144 @@ async function cmdDelete(ticket: string) {
   await provider.deleteVm(env.vm_id)
   registry.remove(ticket)
   console.log('Deleted.')
+}
+
+async function cmdRun(ticket: string, command: string) {
+  const env = registry.get(ticket)
+  if (!env) die(`No environment found for ticket ${ticket}`)
+  const provider = await resolveProvider(ticket)
+
+  const actualStatus = await provider.status(env.vm_id)
+  if (actualStatus !== 'running') {
+    console.log(`Starting ${ticket}...`)
+    await provider.startVm(env.vm_id)
+    registry.updateStatus(ticket, 'running')
+  }
+
+  const info = await provider.sshInfo(env.vm_id)
+  registry.updateIp(ticket, info.host)
+  const envVars = await getSecretBackend().resolve(env.project || '')
+  const code = await sshRun(info, command, envVars)
+  if (code !== 0) process.exit(code)
+}
+
+async function cmdCp(src: string, dest: string) {
+  // Detect direction: TICKET:/path or just local path
+  const srcMatch = src.match(/^([^:]+):(.+)$/)
+  const destMatch = dest.match(/^([^:]+):(.+)$/)
+
+  if (srcMatch && destMatch) die('Cannot copy between two VMs directly. Copy to local first.')
+  if (!srcMatch && !destMatch) die('One of src or dest must be a VM path (TICKET:/path)')
+
+  if (srcMatch) {
+    // VM -> local
+    const [, ticket, remotePath] = srcMatch
+    const env = registry.get(ticket)
+    if (!env) die(`No environment found for ticket ${ticket}`)
+    const provider = await resolveProvider(ticket)
+
+    const actualStatus = await provider.status(env.vm_id)
+    if (actualStatus !== 'running') {
+      console.log(`Starting ${ticket}...`)
+      await provider.startVm(env.vm_id)
+      registry.updateStatus(ticket, 'running')
+    }
+
+    const info = await provider.sshInfo(env.vm_id)
+    registry.updateIp(ticket, info.host)
+    await scpFrom(info, remotePath, dest)
+  } else {
+    // local -> VM
+    const [, ticket, remotePath] = destMatch!
+    const env = registry.get(ticket)
+    if (!env) die(`No environment found for ticket ${ticket}`)
+    const provider = await resolveProvider(ticket)
+
+    const actualStatus = await provider.status(env.vm_id)
+    if (actualStatus !== 'running') {
+      console.log(`Starting ${ticket}...`)
+      await provider.startVm(env.vm_id)
+      registry.updateStatus(ticket, 'running')
+    }
+
+    const info = await provider.sshInfo(env.vm_id)
+    registry.updateIp(ticket, info.host)
+    await scpTo(info, src, remotePath)
+  }
+}
+
+async function cmdBulkCreate(projectName: string, tickets: string[]) {
+  const proj = registry.getProject(projectName)
+  if (!proj) die(`Project ${projectName} not found. Create it with: agent-swarm project create ${projectName}`)
+
+  // Stop project once for clean cloning
+  if (proj.status === 'running') {
+    const provider = await resolveProviderForProject(projectName)
+    console.log(`Stopping project ${projectName} for clean clone...`)
+    await provider.stopVm(proj.vm_id)
+    registry.updateProjectStatus(projectName, 'stopped')
+  }
+
+  const diskPath = projectDiskPath(projectName)
+  if (!existsSync(diskPath)) die(`Project disk not found: ${diskPath}`)
+
+  console.log(`Creating ${tickets.length} ticket VMs in parallel...`)
+  const results = await Promise.allSettled(
+    tickets.map(async (ticket) => {
+      if (registry.get(ticket)) throw new Error(`Ticket ${ticket} already exists`)
+      const provider = await resolveProvider()
+      const vm = await provider.createVm(ticket, diskPath)
+      registry.register({
+        ticket,
+        project: projectName,
+        provider: provider.name,
+        vm_id: vm.vmId,
+        base_image: proj.base_image,
+        ip: vm.ip,
+        status: vm.status,
+      })
+      return vm
+    })
+  )
+
+  for (let i = 0; i < tickets.length; i++) {
+    const result = results[i]
+    if (result.status === 'fulfilled') {
+      console.log(`  ${tickets[i]}: created (${result.value.vmId})`)
+    } else {
+      console.error(`  ${tickets[i]}: FAILED - ${result.reason?.message ?? result.reason}`)
+    }
+  }
+
+  const succeeded = results.filter(r => r.status === 'fulfilled').length
+  const failed = results.filter(r => r.status === 'rejected').length
+  console.log(`\n${succeeded} created, ${failed} failed`)
+}
+
+async function cmdBulkDelete(tickets: string[]) {
+  console.log(`Deleting ${tickets.length} ticket VMs in parallel...`)
+  const results = await Promise.allSettled(
+    tickets.map(async (ticket) => {
+      const env = registry.get(ticket)
+      if (!env) throw new Error(`No environment found for ticket ${ticket}`)
+      const provider = await resolveProvider(ticket)
+      await provider.deleteVm(env.vm_id)
+      registry.remove(ticket)
+    })
+  )
+
+  for (let i = 0; i < tickets.length; i++) {
+    const result = results[i]
+    if (result.status === 'fulfilled') {
+      console.log(`  ${tickets[i]}: deleted`)
+    } else {
+      console.error(`  ${tickets[i]}: FAILED - ${result.reason?.message ?? result.reason}`)
+    }
+  }
+
+  const succeeded = results.filter(r => r.status === 'fulfilled').length
+  const failed = results.filter(r => r.status === 'rejected').length
+  console.log(`\n${succeeded} deleted, ${failed} failed`)
 }
 
 async function cmdStatus() {
@@ -421,6 +595,56 @@ async function cmdInitBase() {
   console.log('Create a project with: agent-swarm project create <NAME>')
 }
 
+// --- Env commands ---
+
+function parseProjectFlag(args: string[]): string | undefined {
+  const idx = args.indexOf('--project')
+  if (idx === -1) return undefined
+  return args[idx + 1]
+}
+
+async function cmdEnvSet(key: string, value: string, project?: string) {
+  const backend = getSecretBackend()
+  await backend.set(key, value, project)
+  const scope = project ? ` (project: ${project})` : ' (global)'
+  console.log(`Set ${key}${scope}`)
+}
+
+async function cmdEnvList(project?: string) {
+  const backend = getSecretBackend()
+  if (project) {
+    // Show resolved names for this project (global + overrides)
+    const resolved = await backend.resolve(project)
+    const names = Object.keys(resolved).sort()
+    if (names.length === 0) {
+      console.log(`No env vars configured for project ${project}.`)
+      return
+    }
+    console.log(`Env vars for project ${project} (resolved):`)
+    for (const name of names) {
+      console.log(`  ${name}`)
+    }
+  } else {
+    // Show global vars
+    const vars = await backend.list('')
+    if (vars.length === 0) {
+      console.log('No global env vars configured. Set one with: agent-swarm env set <KEY> <VALUE>')
+      return
+    }
+    console.log('Global env vars:')
+    for (const v of vars) {
+      console.log(`  ${v.name}`)
+    }
+  }
+}
+
+async function cmdEnvRm(key: string, project?: string) {
+  const backend = getSecretBackend()
+  await backend.remove(key, project)
+  const scope = project ? ` (project: ${project})` : ' (global)'
+  console.log(`Removed ${key}${scope}`)
+}
+
 // --- Main ---
 
 const args = process.argv.slice(2)
@@ -445,6 +669,10 @@ try {
           if (!name) die('Usage: agent-swarm project ssh <NAME>')
           await cmdProjectSsh(name)
           break
+        case 'run':
+          if (!name || args.length < 4) die('Usage: agent-swarm project run <NAME> <command...>')
+          await cmdProjectRun(name, args.slice(3).join(' '))
+          break
         case 'stop':
           if (!name) die('Usage: agent-swarm project stop <NAME>')
           await cmdProjectStop(name)
@@ -462,6 +690,31 @@ try {
       }
       break
     }
+    case 'env': {
+      const envCmd = args[1]
+      const project = parseProjectFlag(args)
+      switch (envCmd) {
+        case 'set': {
+          const key = args[2]
+          const value = args[3]
+          if (!key || !value) die('Usage: agent-swarm env set <KEY> <VALUE> [--project <NAME>]')
+          await cmdEnvSet(key, value, project)
+          break
+        }
+        case 'list':
+          await cmdEnvList(project)
+          break
+        case 'rm': {
+          const key = args[2]
+          if (!key) die('Usage: agent-swarm env rm <KEY> [--project <NAME>]')
+          await cmdEnvRm(key, project)
+          break
+        }
+        default:
+          die(`Unknown env subcommand: ${envCmd}. Use 'set', 'list', or 'rm'.`)
+      }
+      break
+    }
     case 'create': {
       const projectName = args[1]
       const ticket = args[2]
@@ -476,6 +729,43 @@ try {
       if (!args[1]) die('Usage: agent-swarm ssh <TICKET>')
       await cmdSsh(args[1])
       break
+    case 'run':
+      if (!args[1] || args.length < 3) die('Usage: agent-swarm run <TICKET> <command...>')
+      await cmdRun(args[1], args.slice(2).join(' '))
+      break
+    case 'cp':
+      if (!args[1] || !args[2]) die('Usage: agent-swarm cp <src> <dest>')
+      await cmdCp(args[1], args[2])
+      break
+    case 'bulk': {
+      const bulkCmd = args[1]
+      switch (bulkCmd) {
+        case 'create': {
+          const bulkProject = args[2]
+          const bulkTickets = args.slice(3)
+          if (!bulkProject || bulkTickets.length === 0) die('Usage: agent-swarm bulk create <PROJECT> <T1> <T2> ...')
+          await cmdBulkCreate(bulkProject, bulkTickets)
+          break
+        }
+        case 'delete': {
+          if (args[2] === '--project') {
+            const projName = args[3]
+            if (!projName) die('Usage: agent-swarm bulk delete --project <NAME>')
+            const tickets = registry.list().filter(e => e.project === projName)
+            if (tickets.length === 0) die(`No tickets found for project ${projName}`)
+            await cmdBulkDelete(tickets.map(t => t.ticket))
+          } else {
+            const bulkTickets = args.slice(2)
+            if (bulkTickets.length === 0) die('Usage: agent-swarm bulk delete <T1> <T2> ...')
+            await cmdBulkDelete(bulkTickets)
+          }
+          break
+        }
+        default:
+          die(`Unknown bulk subcommand: ${bulkCmd}. Use 'create' or 'delete'.`)
+      }
+      break
+    }
     case 'stop':
       if (!args[1]) die('Usage: agent-swarm stop <TICKET>')
       await cmdStop(args[1])

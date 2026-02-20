@@ -47,10 +47,16 @@
 - [ ] Tab completion for ticket names
 
 ## Phase 7: Multi-Agent Orchestration
-- [ ] `agent-swarm run <TICKET> <command>` - run a command inside a VM via SSH
-- [ ] `agent-swarm bulk create TICKET-1 TICKET-2 TICKET-3` - spin up multiple at once
-- [ ] `agent-swarm bulk delete --all` - tear down everything
-- [ ] Parallel VM creation (don't wait for one to finish before starting next)
+- [x] `agent-swarm run <TICKET> <command>` - run a command inside a VM via SSH
+- [x] `agent-swarm project run <NAME> <command>` - run a command in a project VM
+- [x] `agent-swarm bulk create <PROJECT> TICKET-1 TICKET-2 ...` - spin up multiple at once
+- [x] `agent-swarm bulk delete` - tear down tickets in parallel (by name or `--project`)
+- [x] Parallel VM creation with `Promise.allSettled()`
+- [x] `agent-swarm cp` - copy files in/out of VMs via scp
+- [x] Environment variable forwarding (`~/.agent-swarm/env` config)
+- [x] Encrypted env var storage (AES-256-GCM, macOS Keychain key)
+- [x] Global and per-project env var scoping
+- [x] Env vars forwarded into SSH interactive sessions
 - [ ] Resource limit checks (don't oversubscribe host CPU/RAM)
 
 ## Phase 8: Cloud Providers
@@ -58,6 +64,14 @@
 - [ ] GCP Compute Engine provider (preemptible VMs, machine images)
 - [ ] Auto-stop idle VMs (cost savings for cloud)
 - [ ] Estimated cost display for cloud VMs
+
+## Phase 9: Secret Backend Plugins
+- [ ] Config file for selecting secret backend (`~/.agent-swarm/config.json`)
+- [ ] HashiCorp Vault backend
+- [ ] 1Password backend (via CLI)
+- [ ] AWS Secrets Manager backend
+- [ ] Linux `libsecret` KeyProvider (for Linux Keychain equivalent)
+- [ ] Windows Credential Manager KeyProvider
 
 ## Future Ideas
 - [ ] Web dashboard showing all running VMs and their status

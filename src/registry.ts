@@ -56,6 +56,14 @@ function getDb(): DatabaseSync {
       created_at  TEXT DEFAULT (datetime('now'))
     )
   `)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS env_var (
+      name    TEXT NOT NULL,
+      scope   TEXT NOT NULL DEFAULT '',
+      value   TEXT NOT NULL,
+      PRIMARY KEY (name, scope)
+    )
+  `)
   // Migrate: add project column if missing from existing DB
   const cols = db.prepare("PRAGMA table_info(environment)").all() as Array<{ name: string }>
   if (!cols.some(c => c.name === 'project')) {
@@ -132,4 +140,38 @@ export function updateIp(ticket: string, ip: string): void {
 export function remove(ticket: string): void {
   const d = getDb()
   d.prepare('DELETE FROM environment WHERE ticket = ?').run(ticket)
+}
+
+// --- Env var CRUD ---
+
+export function setEnvVar(name: string, scope: string, encryptedValue: string): void {
+  const d = getDb()
+  d.prepare(`
+    INSERT INTO env_var (name, scope, value) VALUES (?, ?, ?)
+    ON CONFLICT(name, scope) DO UPDATE SET value = excluded.value
+  `).run(name, scope, encryptedValue)
+}
+
+export function getEnvVar(name: string, scope: string): string | undefined {
+  const d = getDb()
+  const row = d.prepare('SELECT value FROM env_var WHERE name = ? AND scope = ?').get(name, scope) as { value: string } | undefined
+  return row?.value
+}
+
+export function removeEnvVar(name: string, scope: string): void {
+  const d = getDb()
+  d.prepare('DELETE FROM env_var WHERE name = ? AND scope = ?').run(name, scope)
+}
+
+export function listEnvVars(scope?: string): Array<{ name: string; scope: string }> {
+  const d = getDb()
+  if (scope !== undefined) {
+    return d.prepare('SELECT name, scope FROM env_var WHERE scope = ? ORDER BY name').all(scope) as Array<{ name: string; scope: string }>
+  }
+  return d.prepare('SELECT name, scope FROM env_var ORDER BY scope, name').all() as Array<{ name: string; scope: string }>
+}
+
+export function listEnvVarsByScope(scope: string): Array<{ name: string; value: string }> {
+  const d = getDb()
+  return d.prepare('SELECT name, value FROM env_var WHERE scope = ? ORDER BY name').all(scope) as Array<{ name: string; value: string }>
 }
