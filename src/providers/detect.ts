@@ -1,12 +1,14 @@
 import type { Provider } from '../provider.ts'
 import { createMacNativeProvider } from './macos-native.ts'
+import { createKvmProvider } from './kvm.ts'
+import { createHypervProvider } from './hyperv.ts'
 
 type ProviderFactory = () => Provider
 
 const providers: ProviderFactory[] = [
   createMacNativeProvider,
-  // createHypervProvider,  // future: Windows
-  // createKvmProvider,     // future: Linux
+  createKvmProvider,
+  createHypervProvider,
 ]
 
 /** Detect the first available provider on this machine. */
@@ -22,6 +24,8 @@ export async function detectProvider(): Promise<Provider | null> {
 export function getProvider(name: string): Provider | null {
   const map: Record<string, ProviderFactory> = {
     'macos-native': createMacNativeProvider,
+    'kvm': createKvmProvider,
+    'hyperv': createHypervProvider,
   }
   const factory = map[name]
   return factory ? factory() : null

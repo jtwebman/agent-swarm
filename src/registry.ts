@@ -14,7 +14,7 @@ export type ProjectRow = {
 }
 
 export type EnvironmentRow = {
-  ticket: string
+  task: string
   project: string
   provider: string
   vm_id: string
@@ -46,7 +46,7 @@ function getDb(): DatabaseSync {
   `)
   db.exec(`
     CREATE TABLE IF NOT EXISTS environment (
-      ticket      TEXT PRIMARY KEY,
+      task        TEXT PRIMARY KEY,
       project     TEXT NOT NULL DEFAULT '' REFERENCES project(name),
       provider    TEXT NOT NULL,
       vm_id       TEXT NOT NULL,
@@ -68,6 +68,10 @@ function getDb(): DatabaseSync {
   const cols = db.prepare("PRAGMA table_info(environment)").all() as Array<{ name: string }>
   if (!cols.some(c => c.name === 'project')) {
     db.exec("ALTER TABLE environment ADD COLUMN project TEXT NOT NULL DEFAULT '' REFERENCES project(name)")
+  }
+  // Migrate: rename ticket column to task if old schema exists
+  if (cols.some(c => c.name === 'ticket') && !cols.some(c => c.name === 'task')) {
+    db.exec("ALTER TABLE environment RENAME COLUMN ticket TO task")
   }
   return db
 }
@@ -107,19 +111,19 @@ export function removeProject(name: string): void {
   d.prepare('DELETE FROM project WHERE name = ?').run(name)
 }
 
-// --- Environment (ticket) CRUD ---
+// --- Environment (task) CRUD ---
 
 export function register(row: Omit<EnvironmentRow, 'created_at'>): void {
   const d = getDb()
   d.prepare(`
-    INSERT INTO environment (ticket, project, provider, vm_id, base_image, ip, status)
+    INSERT INTO environment (task, project, provider, vm_id, base_image, ip, status)
     VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(row.ticket, row.project, row.provider, row.vm_id, row.base_image, row.ip, row.status)
+  `).run(row.task, row.project, row.provider, row.vm_id, row.base_image, row.ip, row.status)
 }
 
-export function get(ticket: string): EnvironmentRow | undefined {
+export function get(task: string): EnvironmentRow | undefined {
   const d = getDb()
-  return d.prepare('SELECT * FROM environment WHERE ticket = ?').get(ticket) as EnvironmentRow | undefined
+  return d.prepare('SELECT * FROM environment WHERE task = ?').get(task) as EnvironmentRow | undefined
 }
 
 export function list(): EnvironmentRow[] {
@@ -127,19 +131,19 @@ export function list(): EnvironmentRow[] {
   return d.prepare('SELECT * FROM environment ORDER BY created_at DESC').all() as EnvironmentRow[]
 }
 
-export function updateStatus(ticket: string, status: string): void {
+export function updateStatus(task: string, status: string): void {
   const d = getDb()
-  d.prepare('UPDATE environment SET status = ? WHERE ticket = ?').run(status, ticket)
+  d.prepare('UPDATE environment SET status = ? WHERE task = ?').run(status, task)
 }
 
-export function updateIp(ticket: string, ip: string): void {
+export function updateIp(task: string, ip: string): void {
   const d = getDb()
-  d.prepare('UPDATE environment SET ip = ? WHERE ticket = ?').run(ip, ticket)
+  d.prepare('UPDATE environment SET ip = ? WHERE task = ?').run(ip, task)
 }
 
-export function remove(ticket: string): void {
+export function remove(task: string): void {
   const d = getDb()
-  d.prepare('DELETE FROM environment WHERE ticket = ?').run(ticket)
+  d.prepare('DELETE FROM environment WHERE task = ?').run(task)
 }
 
 // --- Env var CRUD ---

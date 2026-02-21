@@ -2,14 +2,13 @@
 
 import * as registry from './registry.ts'
 import { detectProvider, getProvider, listProviders } from './providers/detect.ts'
-import { projectDiskPath } from './providers/macos-native.ts'
 import { sshInteractive, sshRun, scpTo, scpFrom } from './ssh.ts'
 import type { Provider } from './provider.ts'
 import { getSecretBackend } from './secrets.ts'
 import { existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { exec } from './exec.ts'
+import { exec, execOk } from './exec.ts'
 import { spawn as nodeSpawn } from 'node:child_process'
 
 const BASE_IMAGE_DIR = join(homedir(), '.agent-swarm', 'base-images')
@@ -24,23 +23,23 @@ Usage:
   agent-swarm project list                         List all projects
   agent-swarm project ssh <NAME>                   SSH into a project VM (auto-starts)
   agent-swarm project run <NAME> <command...>      Run a command in a project VM
-  agent-swarm project stop <NAME>                  Stop and save project (new ticket baseline)
+  agent-swarm project stop <NAME>                  Stop and save project (new task baseline)
   agent-swarm project code <NAME> [path]           Open VS Code remote into project VM
   agent-swarm project delete <NAME>                Delete a project VM and its disk
 
-  agent-swarm create <PROJECT> <TICKET>            Create a ticket VM (cloned from project)
-  agent-swarm list                                 List all ticket VMs
-  agent-swarm ssh <TICKET>                         SSH into a ticket VM
-  agent-swarm run <TICKET> <command...>            Run a command inside a ticket VM
-  agent-swarm stop <TICKET>                        Stop a ticket VM
-  agent-swarm start <TICKET>                       Start a stopped ticket VM
-  agent-swarm code <TICKET> [path]                  Open VS Code remote into ticket VM
-  agent-swarm delete <TICKET>                      Delete a ticket VM
+  agent-swarm create <PROJECT> <TASK>              Create a task VM (cloned from project)
+  agent-swarm list                                 List all task VMs
+  agent-swarm ssh <TASK>                           SSH into a task VM
+  agent-swarm run <TASK> <command...>              Run a command inside a task VM
+  agent-swarm stop <TASK>                          Stop a task VM
+  agent-swarm start <TASK>                         Start a stopped task VM
+  agent-swarm code <TASK> [path]                   Open VS Code remote into task VM
+  agent-swarm delete <TASK>                        Delete a task VM
 
   agent-swarm cp <src> <dest>                      Copy files in/out of a VM
-  agent-swarm bulk create <PROJECT> <T1> <T2> ...  Create multiple tickets in parallel
-  agent-swarm bulk delete <T1> <T2> ...            Delete multiple tickets in parallel
-  agent-swarm bulk delete --project <NAME>         Delete all tickets for a project
+  agent-swarm bulk create <PROJECT> <T1> <T2> ...  Create multiple tasks in parallel
+  agent-swarm bulk delete <T1> <T2> ...            Delete multiple tasks in parallel
+  agent-swarm bulk delete --project <NAME>         Delete all tasks for a project
 
   agent-swarm env set <KEY> <VALUE>                Set a global env var (encrypted)
   agent-swarm env set <KEY> <VALUE> --project X    Set a per-project env var override
@@ -49,8 +48,8 @@ Usage:
   agent-swarm env rm <KEY>                         Remove a global env var
   agent-swarm env rm <KEY> --project X             Remove a per-project env var
 
-  agent-swarm checkpoint <TICKET> [name]           Create a snapshot
-  agent-swarm restore <TICKET> [name]              Restore a snapshot
+  agent-swarm checkpoint <TASK> [name]             Create a snapshot
+  agent-swarm restore <TASK> [name]                Restore a snapshot
   agent-swarm status                               Resource overview
   agent-swarm providers                            List available providers`)
   process.exit(0)
@@ -61,13 +60,13 @@ function die(msg: string): never {
   process.exit(1)
 }
 
-async function resolveProvider(ticket?: string): Promise<Provider> {
-  if (ticket) {
-    const env = registry.get(ticket)
+async function resolveProvider(task?: string): Promise<Provider> {
+  if (task) {
+    const env = registry.get(task)
     if (env) {
       const p = getProvider(env.provider)
       if (p) return p
-      die(`Provider '${env.provider}' not available for ticket ${ticket}`)
+      die(`Provider '${env.provider}' not available for task ${task}`)
     }
   }
   const p = await detectProvider()
@@ -75,8 +74,8 @@ async function resolveProvider(ticket?: string): Promise<Provider> {
     die(
       'No VM provider found.\n' +
       '  Mac:     Requires Xcode Command Line Tools: xcode-select --install\n' +
-      '  Linux:   apt install libvirt-daemon-system virtinst (future)\n' +
-      '  Windows: Enable Hyper-V in Windows Features (future)'
+      '  Linux:   apt install qemu-kvm libvirt-daemon-system virtinst genisoimage ovmf\n' +
+      '  Windows: Enable Hyper-V in Windows Features (Pro/Enterprise)'
     )
   }
   return p
@@ -96,8 +95,8 @@ async function resolveProviderForProject(name?: string): Promise<Provider> {
     die(
       'No VM provider found.\n' +
       '  Mac:     Requires Xcode Command Line Tools: xcode-select --install\n' +
-      '  Linux:   apt install libvirt-daemon-system virtinst (future)\n' +
-      '  Windows: Enable Hyper-V in Windows Features (future)'
+      '  Linux:   apt install qemu-kvm libvirt-daemon-system virtinst genisoimage ovmf\n' +
+      '  Windows: Enable Hyper-V in Windows Features (Pro/Enterprise)'
     )
   }
   return p
@@ -106,7 +105,11 @@ async function resolveProviderForProject(name?: string): Promise<Provider> {
 function defaultBaseImage(): string {
   const candidates = [
     join(BASE_IMAGE_DIR, 'ubuntu-24.04.img'),
+    join(BASE_IMAGE_DIR, 'ubuntu-24.04.qcow2'),
+    join(BASE_IMAGE_DIR, 'ubuntu-24.04.vhdx'),
     join(BASE_IMAGE_DIR, 'ubuntu-22.04.img'),
+    join(BASE_IMAGE_DIR, 'ubuntu-22.04.qcow2'),
+    join(BASE_IMAGE_DIR, 'ubuntu-22.04.vhdx'),
   ]
   for (const p of candidates) {
     if (existsSync(p)) return p
@@ -205,7 +208,7 @@ async function cmdProjectStop(name: string) {
   console.log(`Stopping project ${name}...`)
   await provider.stopVm(proj.vm_id)
   registry.updateProjectStatus(name, 'stopped')
-  console.log('Stopped. New tickets will clone from this state.')
+  console.log('Stopped. New tasks will clone from this state.')
 }
 
 async function cmdProjectCode(name: string, remotePath: string) {
@@ -228,30 +231,30 @@ async function cmdProjectCode(name: string, remotePath: string) {
   nodeSpawn('code', ['--remote', remote, remotePath], { detached: true, stdio: 'ignore' }).unref()
 }
 
-async function cmdCode(ticket: string, remotePath: string) {
-  const env = registry.get(ticket)
-  if (!env) die(`No environment found for ticket ${ticket}`)
-  const provider = await resolveProvider(ticket)
+async function cmdCode(task: string, remotePath: string) {
+  const env = registry.get(task)
+  if (!env) die(`No environment found for task ${task}`)
+  const provider = await resolveProvider(task)
 
   // Auto-start if needed
   const actualStatus = await provider.status(env.vm_id)
   if (actualStatus !== 'running') {
-    console.log(`Starting ${ticket}...`)
+    console.log(`Starting ${task}...`)
     await provider.startVm(env.vm_id)
-    registry.updateStatus(ticket, 'running')
+    registry.updateStatus(task, 'running')
   }
 
   const info = await provider.sshInfo(env.vm_id)
-  registry.updateIp(ticket, info.host)
+  registry.updateIp(task, info.host)
   const remote = `ssh-remote+${info.user}@${info.host}`
   console.log(`Opening VS Code: ${info.user}@${info.host}:${remotePath}`)
   nodeSpawn('code', ['--remote', remote, remotePath], { detached: true, stdio: 'ignore' }).unref()
 }
 
 async function cmdProjectDelete(name: string) {
-  const tickets = registry.list().filter(e => e.project === name)
-  if (tickets.length > 0) {
-    die(`Project ${name} still has ${tickets.length} ticket(s): ${tickets.map(t => t.ticket).join(', ')}. Delete them first.`)
+  const tasks = registry.list().filter(e => e.project === name)
+  if (tasks.length > 0) {
+    die(`Project ${name} still has ${tasks.length} task(s): ${tasks.map(t => t.task).join(', ')}. Delete them first.`)
   }
   const proj = registry.getProject(name)
   if (!proj) die(`No project found: ${name}`)
@@ -262,10 +265,10 @@ async function cmdProjectDelete(name: string) {
   console.log('Deleted.')
 }
 
-// --- Ticket commands ---
+// --- Task commands ---
 
-async function cmdCreate(projectName: string, ticket: string) {
-  if (registry.get(ticket)) die(`Ticket ${ticket} already exists`)
+async function cmdCreate(projectName: string, task: string) {
+  if (registry.get(task)) die(`Task ${task} already exists`)
   const proj = registry.getProject(projectName)
   if (!proj) die(`Project ${projectName} not found. Create it with: agent-swarm project create ${projectName}`)
   if (proj.status === 'running') {
@@ -275,14 +278,14 @@ async function cmdCreate(projectName: string, ticket: string) {
     registry.updateProjectStatus(projectName, 'stopped')
   }
 
-  const diskPath = projectDiskPath(projectName)
+  const provider = await resolveProvider()
+  const diskPath = provider.projectDiskPath(projectName)
   if (!existsSync(diskPath)) die(`Project disk not found: ${diskPath}`)
 
-  const provider = await resolveProvider()
-  console.log(`Creating ticket VM for ${ticket} (cloned from project ${projectName})...`)
-  const vm = await provider.createVm(ticket, diskPath)
+  console.log(`Creating task VM for ${task} (cloned from project ${projectName})...`)
+  const vm = await provider.createVm(task, diskPath)
   registry.register({
-    ticket,
+    task,
     project: projectName,
     provider: provider.name,
     vm_id: vm.vmId,
@@ -292,20 +295,20 @@ async function cmdCreate(projectName: string, ticket: string) {
   })
   console.log(`\nVM created: ${vm.vmId}`)
   if (vm.ip) console.log(`IP: ${vm.ip}`)
-  console.log(`SSH: agent-swarm ssh ${ticket}`)
+  console.log(`SSH: agent-swarm ssh ${task}`)
 }
 
 async function cmdList() {
   const envs = registry.list()
   if (envs.length === 0) {
-    console.log('No ticket environments. Create one with: agent-swarm create <PROJECT> <TICKET>')
+    console.log('No task environments. Create one with: agent-swarm create <PROJECT> <TASK>')
     return
   }
-  console.log('TICKET'.padEnd(20) + 'PROJECT'.padEnd(15) + 'PROVIDER'.padEnd(15) + 'IP'.padEnd(18) + 'STATUS'.padEnd(12) + 'CREATED')
+  console.log('TASK'.padEnd(20) + 'PROJECT'.padEnd(15) + 'PROVIDER'.padEnd(15) + 'IP'.padEnd(18) + 'STATUS'.padEnd(12) + 'CREATED')
   console.log('-'.repeat(100))
   for (const env of envs) {
     console.log(
-      env.ticket.padEnd(20) +
+      env.task.padEnd(20) +
       env.project.padEnd(15) +
       env.provider.padEnd(15) +
       (env.ip ?? '-').padEnd(18) +
@@ -315,118 +318,118 @@ async function cmdList() {
   }
 }
 
-async function cmdSsh(ticket: string) {
-  const env = registry.get(ticket)
-  if (!env) die(`No environment found for ticket ${ticket}`)
-  const provider = await resolveProvider(ticket)
+async function cmdSsh(task: string) {
+  const env = registry.get(task)
+  if (!env) die(`No environment found for task ${task}`)
+  const provider = await resolveProvider(task)
   const info = await provider.sshInfo(env.vm_id)
   const envVars = await getSecretBackend().resolve(env.project || '')
-  console.log(`Connecting to ${ticket} (${info.user}@${info.host}:${info.port})...`)
+  console.log(`Connecting to ${task} (${info.user}@${info.host}:${info.port})...`)
   const code = await sshInteractive(info, envVars)
   process.exit(code)
 }
 
-async function cmdStop(ticket: string) {
-  const env = registry.get(ticket)
-  if (!env) die(`No environment found for ticket ${ticket}`)
-  const provider = await resolveProvider(ticket)
-  console.log(`Stopping ${ticket}...`)
+async function cmdStop(task: string) {
+  const env = registry.get(task)
+  if (!env) die(`No environment found for task ${task}`)
+  const provider = await resolveProvider(task)
+  console.log(`Stopping ${task}...`)
   await provider.stopVm(env.vm_id)
-  registry.updateStatus(ticket, 'stopped')
+  registry.updateStatus(task, 'stopped')
   console.log('Stopped.')
 }
 
-async function cmdStart(ticket: string) {
-  const env = registry.get(ticket)
-  if (!env) die(`No environment found for ticket ${ticket}`)
-  const provider = await resolveProvider(ticket)
-  console.log(`Starting ${ticket}...`)
+async function cmdStart(task: string) {
+  const env = registry.get(task)
+  if (!env) die(`No environment found for task ${task}`)
+  const provider = await resolveProvider(task)
+  console.log(`Starting ${task}...`)
   await provider.startVm(env.vm_id)
-  registry.updateStatus(ticket, 'running')
+  registry.updateStatus(task, 'running')
   try {
     const info = await provider.sshInfo(env.vm_id)
-    registry.updateIp(ticket, info.host)
+    registry.updateIp(task, info.host)
     console.log(`Running. IP: ${info.host}`)
   } catch {
     console.log('Running. (IP not yet available)')
   }
 }
 
-async function cmdDelete(ticket: string) {
-  const env = registry.get(ticket)
-  if (!env) die(`No environment found for ticket ${ticket}`)
-  const provider = await resolveProvider(ticket)
-  console.log(`Deleting ${ticket}...`)
+async function cmdDelete(task: string) {
+  const env = registry.get(task)
+  if (!env) die(`No environment found for task ${task}`)
+  const provider = await resolveProvider(task)
+  console.log(`Deleting ${task}...`)
   await provider.deleteVm(env.vm_id)
-  registry.remove(ticket)
+  registry.remove(task)
   console.log('Deleted.')
 }
 
-async function cmdRun(ticket: string, command: string) {
-  const env = registry.get(ticket)
-  if (!env) die(`No environment found for ticket ${ticket}`)
-  const provider = await resolveProvider(ticket)
+async function cmdRun(task: string, command: string) {
+  const env = registry.get(task)
+  if (!env) die(`No environment found for task ${task}`)
+  const provider = await resolveProvider(task)
 
   const actualStatus = await provider.status(env.vm_id)
   if (actualStatus !== 'running') {
-    console.log(`Starting ${ticket}...`)
+    console.log(`Starting ${task}...`)
     await provider.startVm(env.vm_id)
-    registry.updateStatus(ticket, 'running')
+    registry.updateStatus(task, 'running')
   }
 
   const info = await provider.sshInfo(env.vm_id)
-  registry.updateIp(ticket, info.host)
+  registry.updateIp(task, info.host)
   const envVars = await getSecretBackend().resolve(env.project || '')
   const code = await sshRun(info, command, envVars)
   if (code !== 0) process.exit(code)
 }
 
 async function cmdCp(src: string, dest: string) {
-  // Detect direction: TICKET:/path or just local path
+  // Detect direction: TASK:/path or just local path
   const srcMatch = src.match(/^([^:]+):(.+)$/)
   const destMatch = dest.match(/^([^:]+):(.+)$/)
 
   if (srcMatch && destMatch) die('Cannot copy between two VMs directly. Copy to local first.')
-  if (!srcMatch && !destMatch) die('One of src or dest must be a VM path (TICKET:/path)')
+  if (!srcMatch && !destMatch) die('One of src or dest must be a VM path (TASK:/path)')
 
   if (srcMatch) {
     // VM -> local
-    const [, ticket, remotePath] = srcMatch
-    const env = registry.get(ticket)
-    if (!env) die(`No environment found for ticket ${ticket}`)
-    const provider = await resolveProvider(ticket)
+    const [, task, remotePath] = srcMatch
+    const env = registry.get(task)
+    if (!env) die(`No environment found for task ${task}`)
+    const provider = await resolveProvider(task)
 
     const actualStatus = await provider.status(env.vm_id)
     if (actualStatus !== 'running') {
-      console.log(`Starting ${ticket}...`)
+      console.log(`Starting ${task}...`)
       await provider.startVm(env.vm_id)
-      registry.updateStatus(ticket, 'running')
+      registry.updateStatus(task, 'running')
     }
 
     const info = await provider.sshInfo(env.vm_id)
-    registry.updateIp(ticket, info.host)
+    registry.updateIp(task, info.host)
     await scpFrom(info, remotePath, dest)
   } else {
     // local -> VM
-    const [, ticket, remotePath] = destMatch!
-    const env = registry.get(ticket)
-    if (!env) die(`No environment found for ticket ${ticket}`)
-    const provider = await resolveProvider(ticket)
+    const [, task, remotePath] = destMatch!
+    const env = registry.get(task)
+    if (!env) die(`No environment found for task ${task}`)
+    const provider = await resolveProvider(task)
 
     const actualStatus = await provider.status(env.vm_id)
     if (actualStatus !== 'running') {
-      console.log(`Starting ${ticket}...`)
+      console.log(`Starting ${task}...`)
       await provider.startVm(env.vm_id)
-      registry.updateStatus(ticket, 'running')
+      registry.updateStatus(task, 'running')
     }
 
     const info = await provider.sshInfo(env.vm_id)
-    registry.updateIp(ticket, info.host)
+    registry.updateIp(task, info.host)
     await scpTo(info, src, remotePath)
   }
 }
 
-async function cmdBulkCreate(projectName: string, tickets: string[]) {
+async function cmdBulkCreate(projectName: string, tasks: string[]) {
   const proj = registry.getProject(projectName)
   if (!proj) die(`Project ${projectName} not found. Create it with: agent-swarm project create ${projectName}`)
 
@@ -438,17 +441,19 @@ async function cmdBulkCreate(projectName: string, tickets: string[]) {
     registry.updateProjectStatus(projectName, 'stopped')
   }
 
-  const diskPath = projectDiskPath(projectName)
+  // Resolve provider to get the correct disk path for this platform
+  const resolvedProvider = await resolveProvider()
+  const diskPath = resolvedProvider.projectDiskPath(projectName)
   if (!existsSync(diskPath)) die(`Project disk not found: ${diskPath}`)
 
-  console.log(`Creating ${tickets.length} ticket VMs in parallel...`)
+  console.log(`Creating ${tasks.length} task VMs in parallel...`)
   const results = await Promise.allSettled(
-    tickets.map(async (ticket) => {
-      if (registry.get(ticket)) throw new Error(`Ticket ${ticket} already exists`)
+    tasks.map(async (task) => {
+      if (registry.get(task)) throw new Error(`Task ${task} already exists`)
       const provider = await resolveProvider()
-      const vm = await provider.createVm(ticket, diskPath)
+      const vm = await provider.createVm(task, diskPath)
       registry.register({
-        ticket,
+        task,
         project: projectName,
         provider: provider.name,
         vm_id: vm.vmId,
@@ -460,12 +465,12 @@ async function cmdBulkCreate(projectName: string, tickets: string[]) {
     })
   )
 
-  for (let i = 0; i < tickets.length; i++) {
+  for (let i = 0; i < tasks.length; i++) {
     const result = results[i]
     if (result.status === 'fulfilled') {
-      console.log(`  ${tickets[i]}: created (${result.value.vmId})`)
+      console.log(`  ${tasks[i]}: created (${result.value.vmId})`)
     } else {
-      console.error(`  ${tickets[i]}: FAILED - ${result.reason?.message ?? result.reason}`)
+      console.error(`  ${tasks[i]}: FAILED - ${result.reason?.message ?? result.reason}`)
     }
   }
 
@@ -474,24 +479,24 @@ async function cmdBulkCreate(projectName: string, tickets: string[]) {
   console.log(`\n${succeeded} created, ${failed} failed`)
 }
 
-async function cmdBulkDelete(tickets: string[]) {
-  console.log(`Deleting ${tickets.length} ticket VMs in parallel...`)
+async function cmdBulkDelete(tasks: string[]) {
+  console.log(`Deleting ${tasks.length} task VMs in parallel...`)
   const results = await Promise.allSettled(
-    tickets.map(async (ticket) => {
-      const env = registry.get(ticket)
-      if (!env) throw new Error(`No environment found for ticket ${ticket}`)
-      const provider = await resolveProvider(ticket)
+    tasks.map(async (task) => {
+      const env = registry.get(task)
+      if (!env) throw new Error(`No environment found for task ${task}`)
+      const provider = await resolveProvider(task)
       await provider.deleteVm(env.vm_id)
-      registry.remove(ticket)
+      registry.remove(task)
     })
   )
 
-  for (let i = 0; i < tickets.length; i++) {
+  for (let i = 0; i < tasks.length; i++) {
     const result = results[i]
     if (result.status === 'fulfilled') {
-      console.log(`  ${tickets[i]}: deleted`)
+      console.log(`  ${tasks[i]}: deleted`)
     } else {
-      console.error(`  ${tickets[i]}: FAILED - ${result.reason?.message ?? result.reason}`)
+      console.error(`  ${tasks[i]}: FAILED - ${result.reason?.message ?? result.reason}`)
     }
   }
 
@@ -506,7 +511,7 @@ async function cmdStatus() {
   const running = envs.filter(e => e.status === 'running').length
   const stopped = envs.filter(e => e.status !== 'running').length
   console.log(`Projects: ${projects.length}`)
-  console.log(`Tickets:  ${envs.length} total (${running} running, ${stopped} stopped)`)
+  console.log(`Tasks:    ${envs.length} total (${running} running, ${stopped} stopped)`)
 
   const providers = await listProviders()
   console.log('\nProviders:')
@@ -518,30 +523,30 @@ async function cmdStatus() {
   console.log(`\nBase image: ${baseImg || 'not found (run agent-swarm init-base)'}`)
 }
 
-async function cmdCheckpoint(ticket: string, name?: string) {
-  const env = registry.get(ticket)
-  if (!env) die(`No environment found for ticket ${ticket}`)
-  const provider = await resolveProvider(ticket)
+async function cmdCheckpoint(task: string, name?: string) {
+  const env = registry.get(task)
+  if (!env) die(`No environment found for task ${task}`)
+  const provider = await resolveProvider(task)
   const snapshotName = name ?? new Date().toISOString().replace(/[:.]/g, '-')
-  console.log(`Creating checkpoint '${snapshotName}' for ${ticket}...`)
+  console.log(`Creating checkpoint '${snapshotName}' for ${task}...`)
   await provider.checkpoint(env.vm_id, snapshotName)
   console.log('Checkpoint created.')
 }
 
-async function cmdRestore(ticket: string, name?: string) {
-  const env = registry.get(ticket)
-  if (!env) die(`No environment found for ticket ${ticket}`)
-  const provider = await resolveProvider(ticket)
+async function cmdRestore(task: string, name?: string) {
+  const env = registry.get(task)
+  if (!env) die(`No environment found for task ${task}`)
+  const provider = await resolveProvider(task)
   if (!name) {
     const checkpoints = await provider.listCheckpoints(env.vm_id)
-    if (checkpoints.length === 0) die(`No checkpoints found for ${ticket}`)
+    if (checkpoints.length === 0) die(`No checkpoints found for ${task}`)
     name = checkpoints[checkpoints.length - 1]
     console.log(`Restoring latest checkpoint: ${name}`)
   }
-  console.log(`Restoring ${ticket} to '${name}'...`)
+  console.log(`Restoring ${task} to '${name}'...`)
   await provider.restore(env.vm_id, name!)
-  registry.updateStatus(ticket, 'stopped')
-  console.log('Restored. Start with: agent-swarm start ' + ticket)
+  registry.updateStatus(task, 'stopped')
+  console.log('Restored. Start with: agent-swarm start ' + task)
 }
 
 async function cmdProviders() {
@@ -554,7 +559,8 @@ async function cmdProviders() {
   if (!providers.some(p => p.available)) {
     console.log('\nNo providers available.')
     console.log('  Mac:     Xcode Command Line Tools needed: xcode-select --install')
-    console.log('  Linux:   apt install libvirt-daemon-system virtinst (future)')
+    console.log('  Linux:   apt install qemu-kvm libvirt-daemon-system virtinst genisoimage ovmf')
+    console.log('  Windows: Enable Hyper-V in Windows Features (Pro/Enterprise)')
   }
 }
 
@@ -564,34 +570,85 @@ async function cmdInitBase() {
   const arch = process.arch === 'arm64' ? 'arm64' : 'amd64'
   const imageUrl = `https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-${arch}.img`
   const qcow2Path = join(BASE_IMAGE_DIR, `ubuntu-24.04-${arch}.qcow2`)
-  const rawPath = join(BASE_IMAGE_DIR, 'ubuntu-24.04.img')
 
-  if (existsSync(rawPath)) {
-    console.log(`Base image already exists: ${rawPath}`)
-    console.log('Delete it first if you want to re-download.')
-    return
+  if (process.platform === 'darwin') {
+    // macOS: download qcow2, convert to raw .img via Swift helper
+    const rawPath = join(BASE_IMAGE_DIR, 'ubuntu-24.04.img')
+
+    if (existsSync(rawPath)) {
+      console.log(`Base image already exists: ${rawPath}`)
+      console.log('Delete it first if you want to re-download.')
+      return
+    }
+
+    console.log(`Downloading Ubuntu 24.04 cloud image (${arch})...`)
+    console.log(`  ${imageUrl}`)
+    await exec('curl', ['-L', '--progress-bar', '-o', qcow2Path, imageUrl])
+
+    // Convert qcow2 to raw using our Swift helper
+    const helperBin = join(homedir(), '.agent-swarm', 'bin', 'vm-helper')
+    if (!existsSync(helperBin)) {
+      const provider = await detectProvider()
+      if (!provider) die('No provider available to compile VM helper')
+    }
+
+    console.log('Converting qcow2 to raw disk image...')
+    await exec(helperBin, ['convert-qcow2', qcow2Path, rawPath])
+
+    // Clean up qcow2
+    await exec('rm', ['-f', qcow2Path])
+
+    console.log(`\nBase image ready: ${rawPath}`)
+  } else if (process.platform === 'linux') {
+    // Linux: download qcow2, keep as-is (native QEMU format)
+    const finalPath = join(BASE_IMAGE_DIR, 'ubuntu-24.04.qcow2')
+
+    if (existsSync(finalPath)) {
+      console.log(`Base image already exists: ${finalPath}`)
+      console.log('Delete it first if you want to re-download.')
+      return
+    }
+
+    console.log(`Downloading Ubuntu 24.04 cloud image (${arch})...`)
+    console.log(`  ${imageUrl}`)
+    await exec('curl', ['-L', '--progress-bar', '-o', qcow2Path, imageUrl])
+
+    // The cloud image is already qcow2 — just rename to final path
+    if (qcow2Path !== finalPath) {
+      const { renameSync } = await import('node:fs')
+      renameSync(qcow2Path, finalPath)
+    }
+
+    console.log(`\nBase image ready: ${finalPath}`)
+  } else if (process.platform === 'win32') {
+    // Windows: download qcow2, convert to vhdx via qemu-img
+    const vhdxPath = join(BASE_IMAGE_DIR, 'ubuntu-24.04.vhdx')
+
+    if (existsSync(vhdxPath)) {
+      console.log(`Base image already exists: ${vhdxPath}`)
+      console.log('Delete it first if you want to re-download.')
+      return
+    }
+
+    if (!(await execOk('qemu-img', ['--version']))) {
+      die('qemu-img not found. Install QEMU for Windows to convert cloud images.')
+    }
+
+    console.log(`Downloading Ubuntu 24.04 cloud image (${arch})...`)
+    console.log(`  ${imageUrl}`)
+    await exec('curl', ['-L', '--progress-bar', '-o', qcow2Path, imageUrl])
+
+    console.log('Converting qcow2 to VHDX...')
+    await exec('qemu-img', ['convert', '-f', 'qcow2', '-O', 'vhdx', '-o', 'subformat=dynamic', qcow2Path, vhdxPath])
+
+    // Clean up qcow2
+    await exec('powershell.exe', ['-NoProfile', '-Command', `Remove-Item -Path '${qcow2Path}' -Force`])
+
+    console.log(`\nBase image ready: ${vhdxPath}`)
+  } else {
+    die(`Unsupported platform: ${process.platform}`)
   }
 
-  // Download using curl (built into macOS)
-  console.log(`Downloading Ubuntu 24.04 cloud image (${arch})...`)
-  console.log(`  ${imageUrl}`)
-  await exec('curl', ['-L', '--progress-bar', '-o', qcow2Path, imageUrl])
-
-  // Convert qcow2 to raw using our Swift helper
-  const helperBin = join(homedir(), '.agent-swarm', 'bin', 'vm-helper')
-  if (!existsSync(helperBin)) {
-    // Trigger compilation via provider detection
-    const provider = await detectProvider()
-    if (!provider) die('No provider available to compile VM helper')
-  }
-
-  console.log('Converting qcow2 to raw disk image...')
-  await exec(helperBin, ['convert-qcow2', qcow2Path, rawPath])
-
-  // Clean up qcow2
-  await exec('rm', ['-f', qcow2Path])
-
-  console.log(`\nBase image ready: ${rawPath}`)
   console.log('Create a project with: agent-swarm project create <NAME>')
 }
 
@@ -717,20 +774,20 @@ try {
     }
     case 'create': {
       const projectName = args[1]
-      const ticket = args[2]
-      if (!projectName || !ticket) die('Usage: agent-swarm create <PROJECT> <TICKET>')
-      await cmdCreate(projectName, ticket)
+      const task = args[2]
+      if (!projectName || !task) die('Usage: agent-swarm create <PROJECT> <TASK>')
+      await cmdCreate(projectName, task)
       break
     }
     case 'list':
       await cmdList()
       break
     case 'ssh':
-      if (!args[1]) die('Usage: agent-swarm ssh <TICKET>')
+      if (!args[1]) die('Usage: agent-swarm ssh <TASK>')
       await cmdSsh(args[1])
       break
     case 'run':
-      if (!args[1] || args.length < 3) die('Usage: agent-swarm run <TICKET> <command...>')
+      if (!args[1] || args.length < 3) die('Usage: agent-swarm run <TASK> <command...>')
       await cmdRun(args[1], args.slice(2).join(' '))
       break
     case 'cp':
@@ -742,22 +799,22 @@ try {
       switch (bulkCmd) {
         case 'create': {
           const bulkProject = args[2]
-          const bulkTickets = args.slice(3)
-          if (!bulkProject || bulkTickets.length === 0) die('Usage: agent-swarm bulk create <PROJECT> <T1> <T2> ...')
-          await cmdBulkCreate(bulkProject, bulkTickets)
+          const bulkTasks = args.slice(3)
+          if (!bulkProject || bulkTasks.length === 0) die('Usage: agent-swarm bulk create <PROJECT> <T1> <T2> ...')
+          await cmdBulkCreate(bulkProject, bulkTasks)
           break
         }
         case 'delete': {
           if (args[2] === '--project') {
             const projName = args[3]
             if (!projName) die('Usage: agent-swarm bulk delete --project <NAME>')
-            const tickets = registry.list().filter(e => e.project === projName)
-            if (tickets.length === 0) die(`No tickets found for project ${projName}`)
-            await cmdBulkDelete(tickets.map(t => t.ticket))
+            const tasks = registry.list().filter(e => e.project === projName)
+            if (tasks.length === 0) die(`No tasks found for project ${projName}`)
+            await cmdBulkDelete(tasks.map(t => t.task))
           } else {
-            const bulkTickets = args.slice(2)
-            if (bulkTickets.length === 0) die('Usage: agent-swarm bulk delete <T1> <T2> ...')
-            await cmdBulkDelete(bulkTickets)
+            const bulkTasks = args.slice(2)
+            if (bulkTasks.length === 0) die('Usage: agent-swarm bulk delete <T1> <T2> ...')
+            await cmdBulkDelete(bulkTasks)
           }
           break
         }
@@ -767,31 +824,31 @@ try {
       break
     }
     case 'stop':
-      if (!args[1]) die('Usage: agent-swarm stop <TICKET>')
+      if (!args[1]) die('Usage: agent-swarm stop <TASK>')
       await cmdStop(args[1])
       break
     case 'start':
-      if (!args[1]) die('Usage: agent-swarm start <TICKET>')
+      if (!args[1]) die('Usage: agent-swarm start <TASK>')
       await cmdStart(args[1])
       break
     case 'code':
-      if (!args[1]) die('Usage: agent-swarm code <TICKET> [path]')
+      if (!args[1]) die('Usage: agent-swarm code <TASK> [path]')
       await cmdCode(args[1], args[2] ?? '/home/worker')
       break
     case 'delete':
-      if (!args[1]) die('Usage: agent-swarm delete <TICKET>')
+      if (!args[1]) die('Usage: agent-swarm delete <TASK>')
       await cmdDelete(args[1])
       break
     case 'status':
       await cmdStatus()
       break
     case 'checkpoint': {
-      if (!args[1]) die('Usage: agent-swarm checkpoint <TICKET> [name]')
+      if (!args[1]) die('Usage: agent-swarm checkpoint <TASK> [name]')
       await cmdCheckpoint(args[1], args[2])
       break
     }
     case 'restore': {
-      if (!args[1]) die('Usage: agent-swarm restore <TICKET> [name]')
+      if (!args[1]) die('Usage: agent-swarm restore <TASK> [name]')
       await cmdRestore(args[1], args[2])
       break
     }

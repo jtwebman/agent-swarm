@@ -1,5 +1,6 @@
 import type { Provider, VmInfo, VmStatus, SshInfo } from '../provider.ts'
 import { exec, execOk } from '../exec.ts'
+import { createCloudInitISO } from '../cloud-init.ts'
 import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, openSync, ftruncateSync, closeSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
@@ -12,54 +13,6 @@ const VMS_DIR = join(SWARM_DIR, 'vms')
 const SNAPSHOTS_DIR = join(SWARM_DIR, 'snapshots')
 const BIN_DIR = join(SWARM_DIR, 'bin')
 const HELPER_BIN = join(BIN_DIR, 'vm-helper')
-const SETUP_SCRIPT = join(SWARM_DIR, 'setup.sh')
-
-const DEFAULT_SETUP = `#!/bin/bash
-# Agent Swarm VM Setup Script
-# Edit this file to customize what gets installed in new project VMs.
-# Runs as root during first boot. The 'worker' user already exists.
-
-set -e
-
-# --- System packages ---
-apt-get update
-apt-get install -y \\
-  ca-certificates curl wget git zsh unzip build-essential
-
-# --- Docker (official repo) ---
-install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-chmod a+r /etc/apt/keyrings/docker.asc
-echo "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \$(. /etc/os-release && echo "\$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
-apt-get update
-apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-systemctl enable docker
-systemctl start docker
-usermod -aG docker worker
-
-# --- Default shell to zsh ---
-chsh -s /bin/zsh worker
-
-# --- Oh My Zsh ---
-su - worker -c 'sh -c "\$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended'
-
-# --- nvm + Node.js LTS ---
-su - worker -c 'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash'
-su - worker -c 'export NVM_DIR="\$HOME/.nvm" && . "\$NVM_DIR/nvm.sh" && nvm install --lts'
-
-# --- Claude Code CLI ---
-su - worker -c 'export NVM_DIR="\$HOME/.nvm" && . "\$NVM_DIR/nvm.sh" && npm install -g @anthropic-ai/claude-code'
-`
-
-function ensureSetupScript(): string {
-  if (!existsSync(SETUP_SCRIPT)) {
-    mkdirSync(SWARM_DIR, { recursive: true })
-    writeFileSync(SETUP_SCRIPT, DEFAULT_SETUP)
-    console.log(`Created default setup script: ${SETUP_SCRIPT}`)
-    console.log('Edit it to customize what gets installed in new VMs.')
-  }
-  return readFileSync(SETUP_SCRIPT, 'utf8')
-}
 
 // Resolve source paths relative to this module
 const MODULE_DIR = import.meta.dirname!
@@ -98,12 +51,12 @@ async function vmHelper(...args: string[]): Promise<string> {
   return exec(HELPER_BIN, args)
 }
 
-function vmName(ticket: string): string {
-  return `${VM_PREFIX}${ticket}`
+function vmName(task: string): string {
+  return `${VM_PREFIX}${task}`
 }
 
-function vmDir(ticket: string): string {
-  return join(VMS_DIR, vmName(ticket))
+function vmDir(task: string): string {
+  return join(VMS_DIR, vmName(task))
 }
 
 function projectVmName(name: string): string {
@@ -112,93 +65,6 @@ function projectVmName(name: string): string {
 
 function projectVmDir(name: string): string {
   return join(VMS_DIR, projectVmName(name))
-}
-
-export function projectDiskPath(name: string): string {
-  return join(projectVmDir(name), 'disk.img')
-}
-
-function findSshPubKey(): string {
-  const candidates = ['id_ed25519.pub', 'id_rsa.pub', 'id_ecdsa.pub']
-  for (const name of candidates) {
-    const p = join(homedir(), '.ssh', name)
-    if (existsSync(p)) return readFileSync(p, 'utf8').trim()
-  }
-  return ''
-}
-
-async function createCloudInitISO(dir: string, ticket: string): Promise<void> {
-  const tmpDir = join(dir, 'cidata-tmp')
-  mkdirSync(tmpDir, { recursive: true })
-
-  const sshKey = findSshPubKey()
-
-  writeFileSync(
-    join(tmpDir, 'meta-data'),
-    `instance-id: ${ticket}\nlocal-hostname: ${ticket}\n`
-  )
-
-  let userData = `#cloud-config
-password: admin
-chpasswd:
-  expire: false
-ssh_pwauth: true
-`
-  if (sshKey) {
-    userData += `ssh_authorized_keys:
-  - ${sshKey}
-`
-  }
-  // Read the user-customizable setup script from host
-  const setupScript = ensureSetupScript()
-  // Indent content for YAML block scalar
-  const setupIndented = setupScript.split('\n').map(l => `      ${l}`).join('\n')
-
-  userData += `write_files:
-  - path: /usr/local/bin/code
-    permissions: "0755"
-    content: |
-      #!/bin/bash
-      path="\${1:-.}"
-      [[ "\$path" != /* ]] && path="\$PWD/\$path"
-      echo "\$path" | nc -q0 127.0.0.1 19418 2>/dev/null || echo "code forwarding not available (connect via agent-swarm ssh)"
-  - path: /opt/agent-swarm/setup.sh
-    permissions: "0755"
-    content: |
-${setupIndented}
-runcmd:
-  # Create worker user
-  - useradd -m -s /bin/bash -G sudo,adm worker
-  - "echo 'worker ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/worker"
-  - chmod 440 /etc/sudoers.d/worker
-  - mkdir -p /home/worker/.ssh
-  - cp /home/ubuntu/.ssh/authorized_keys /home/worker/.ssh/authorized_keys
-  - chown -R worker:worker /home/worker/.ssh
-  - chmod 700 /home/worker/.ssh
-  - chmod 600 /home/worker/.ssh/authorized_keys
-  - "echo 'worker:worker' | chpasswd"
-  # Run user-customizable setup script
-  - /opt/agent-swarm/setup.sh
-`
-  writeFileSync(join(tmpDir, 'user-data'), userData)
-
-  // Create ISO using built-in hdiutil
-  await exec('hdiutil', [
-    'makehybrid', '-iso', '-joliet',
-    '-default-volume-name', 'cidata',
-    '-o', join(dir, 'cidata.iso'),
-    tmpDir,
-  ])
-
-  // hdiutil may add .cdr extension - rename if needed
-  const cdrPath = join(dir, 'cidata.iso.cdr')
-  if (existsSync(cdrPath) && !existsSync(join(dir, 'cidata.iso'))) {
-    const { renameSync } = await import('node:fs')
-    renameSync(cdrPath, join(dir, 'cidata.iso'))
-  }
-
-  // Clean up temp dir
-  await exec('rm', ['-rf', tmpDir])
 }
 
 function generateMacAddress(): string {
@@ -265,12 +131,12 @@ export function createMacNativeProvider(): Provider {
       return execOk('swiftc', ['--version'])
     },
 
-    async createVm(ticket: string, baseImage: string): Promise<VmInfo> {
-      // Determine if this is a ticket clone (source is a project disk inside VMS_DIR)
-      const isTicketClone = baseImage.startsWith(VMS_DIR)
+    async createVm(task: string, baseImage: string): Promise<VmInfo> {
+      // Determine if this is a task clone (source is a project disk inside VMS_DIR)
+      const isTaskClone = baseImage.startsWith(VMS_DIR)
 
-      const name = isTicketClone ? vmName(ticket) : projectVmName(ticket)
-      const dir = isTicketClone ? vmDir(ticket) : projectVmDir(ticket)
+      const name = isTaskClone ? vmName(task) : projectVmName(task)
+      const dir = isTaskClone ? vmDir(task) : projectVmDir(task)
       mkdirSync(dir, { recursive: true })
 
       // Clone base image using APFS copy-on-write (instant)
@@ -278,7 +144,7 @@ export function createMacNativeProvider(): Provider {
       console.log('  Cloning disk (APFS copy-on-write)...')
       await exec('cp', ['-c', baseImage, diskPath])
 
-      if (!isTicketClone) {
+      if (!isTaskClone) {
         // Project VM from base image: resize disk and create cloud-init
         const desiredSize = 20 * 1024 * 1024 * 1024
         const fd = openSync(diskPath, 'r+')
@@ -289,9 +155,9 @@ export function createMacNativeProvider(): Provider {
         closeSync(fd)
 
         console.log('  Creating cloud-init config...')
-        await createCloudInitISO(dir, ticket)
+        await createCloudInitISO(dir, task)
       } else {
-        // Ticket clone: copy the project's cidata.iso for network config
+        // Task clone: copy the project's cidata.iso for network config
         const projectDir = join(baseImage, '..')
         const projectCidata = join(projectDir, 'cidata.iso')
         if (existsSync(projectCidata)) {
@@ -299,10 +165,10 @@ export function createMacNativeProvider(): Provider {
         }
       }
 
-      // Create VM config — for ticket clones, reuse the project's MAC address
+      // Create VM config — for task clones, reuse the project's MAC address
       // so the guest network config (netplan) matches the interface
       let macAddress: string
-      if (isTicketClone) {
+      if (isTaskClone) {
         const projectConfigPath = join(baseImage, '..', 'config.json')
         const projectConfig: VMConfig = JSON.parse(readFileSync(projectConfigPath, 'utf8'))
         macAddress = projectConfig.macAddress
@@ -330,13 +196,13 @@ export function createMacNativeProvider(): Provider {
         console.log('  Waiting for SSH...')
         await waitForSsh(ip, 'worker')
 
-        if (!isTicketClone) {
+        if (!isTaskClone) {
           console.log('  Waiting for setup to complete (this may take a few minutes)...')
           await waitForCloudInit(ip, 'worker')
         }
       }
 
-      return { vmId: name, ticket, ip, status: 'running' }
+      return { vmId: name, task, ip, status: 'running' }
     },
 
     async startVm(vmId: string): Promise<void> {
@@ -418,12 +284,16 @@ export function createMacNativeProvider(): Provider {
         .filter(v => v.name.startsWith(VM_PREFIX) || v.name.startsWith(PROJECT_PREFIX))
         .map(v => ({
           vmId: v.name,
-          ticket: v.name.startsWith(PROJECT_PREFIX)
+          task: v.name.startsWith(PROJECT_PREFIX)
             ? v.name.slice(PROJECT_PREFIX.length)
             : v.name.slice(VM_PREFIX.length),
           ip: v.ip,
           status: (v.status as VmStatus) || 'unknown',
         }))
+    },
+
+    projectDiskPath(name: string): string {
+      return join(projectVmDir(name), 'disk.img')
     },
   }
 }

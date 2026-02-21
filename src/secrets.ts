@@ -1,5 +1,8 @@
 import { randomBytes, createCipheriv, createDecipheriv } from 'node:crypto'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { join } from 'node:path'
+import { homedir } from 'node:os'
 import * as registry from './registry.ts'
 
 // --- Interfaces ---
@@ -55,6 +58,108 @@ export class MacKeychainKeyProvider implements KeyProvider {
 
     this.cached = key
     return this.cached
+  }
+}
+
+// --- LibsecretKeyProvider (Linux) ---
+
+const LIBSECRET_SERVICE = 'agent-swarm'
+const LIBSECRET_ACCOUNT = 'master-key'
+
+export class LibsecretKeyProvider implements KeyProvider {
+  private cached: Buffer | null = null
+
+  async getOrCreateKey(): Promise<Buffer> {
+    if (this.cached) return this.cached
+
+    // Try to retrieve existing key
+    try {
+      const hex = execFileSync('secret-tool', [
+        'lookup', 'service', LIBSECRET_SERVICE, 'account', LIBSECRET_ACCOUNT,
+      ], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+      if (hex) {
+        this.cached = Buffer.from(hex, 'hex')
+        return this.cached
+      }
+    } catch {
+      // Key doesn't exist yet — generate and store
+    }
+
+    const key = randomBytes(32)
+    const hex = key.toString('hex')
+    // Pipe hex via stdin to avoid leaking the key in `ps` output
+    spawnSync('secret-tool', [
+      'store', '--label=agent-swarm',
+      'service', LIBSECRET_SERVICE,
+      'account', LIBSECRET_ACCOUNT,
+    ], { input: hex, stdio: ['pipe', 'ignore', 'ignore'] })
+
+    this.cached = key
+    return this.cached
+  }
+}
+
+// --- WindowsCredentialKeyProvider (Windows DPAPI) ---
+
+export class WindowsCredentialKeyProvider implements KeyProvider {
+  private cached: Buffer | null = null
+  private keyFilePath: string
+
+  constructor() {
+    const appData = process.env.APPDATA || join(homedir(), 'AppData', 'Roaming')
+    this.keyFilePath = join(appData, 'agent-swarm', 'master.key')
+  }
+
+  async getOrCreateKey(): Promise<Buffer> {
+    if (this.cached) return this.cached
+
+    if (existsSync(this.keyFilePath)) {
+      // Read DPAPI-encrypted key file and decrypt
+      try {
+        const hex = execFileSync('powershell.exe', [
+          '-NoProfile', '-NonInteractive', '-Command',
+          `$encrypted = [IO.File]::ReadAllBytes('${this.keyFilePath}'); ` +
+          `$decrypted = [Security.Cryptography.ProtectedData]::Unprotect($encrypted, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser); ` +
+          `[BitConverter]::ToString($decrypted).Replace('-', '')`,
+        ], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+        this.cached = Buffer.from(hex, 'hex')
+        return this.cached
+      } catch {
+        // Corrupted file — regenerate
+      }
+    }
+
+    const key = randomBytes(32)
+    const hex = key.toString('hex')
+
+    // Encrypt with DPAPI and write to file
+    const dir = join(this.keyFilePath, '..')
+    mkdirSync(dir, { recursive: true })
+    execFileSync('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-Command',
+      `Add-Type -AssemblyName System.Security; ` +
+      `$bytes = [byte[]]@(${Array.from(key).join(',')}); ` +
+      `$encrypted = [Security.Cryptography.ProtectedData]::Protect($bytes, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser); ` +
+      `[IO.File]::WriteAllBytes('${this.keyFilePath}', $encrypted)`,
+    ], { stdio: 'ignore' })
+
+    this.cached = key
+    return this.cached
+  }
+}
+
+// --- Platform-aware KeyProvider factory ---
+
+function createKeyProvider(): KeyProvider {
+  switch (process.platform) {
+    case 'darwin':
+      return new MacKeychainKeyProvider()
+    case 'linux':
+      return new LibsecretKeyProvider()
+    case 'win32':
+      return new WindowsCredentialKeyProvider()
+    default:
+      throw new Error(`Unsupported platform for key storage: ${process.platform}`)
   }
 }
 
@@ -141,7 +246,7 @@ let backendInstance: SecretBackend | null = null
 
 export function getSecretBackend(): SecretBackend {
   if (!backendInstance) {
-    backendInstance = new SqliteSecretBackend(new MacKeychainKeyProvider())
+    backendInstance = new SqliteSecretBackend(createKeyProvider())
   }
   return backendInstance
 }

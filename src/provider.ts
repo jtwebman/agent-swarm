@@ -2,7 +2,7 @@ export type VmStatus = 'running' | 'stopped' | 'creating' | 'unknown'
 
 export type VmInfo = {
   vmId: string
-  ticket: string
+  task: string
   ip: string | null
   status: VmStatus
 }
@@ -16,7 +16,7 @@ export type SshInfo = {
 export type Provider = {
   name: string
   available: () => Promise<boolean>
-  createVm: (ticket: string, baseImage: string) => Promise<VmInfo>
+  createVm: (task: string, baseImage: string) => Promise<VmInfo>
   startVm: (vmId: string) => Promise<void>
   stopVm: (vmId: string) => Promise<void>
   deleteVm: (vmId: string) => Promise<void>
@@ -26,4 +26,5 @@ export type Provider = {
   listCheckpoints: (vmId: string) => Promise<string[]>
   status: (vmId: string) => Promise<VmStatus>
   listVms: () => Promise<VmInfo[]>
+  projectDiskPath: (name: string) => string
 }
